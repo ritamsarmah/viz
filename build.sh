@@ -1,1 +1,1 @@
-odin build .
+odin build . -target=linux_arm64

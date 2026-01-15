@@ -1,7 +1,9 @@
 package main
 
+import "base:runtime"
 import "core:c"
 import "core:math"
+import "core:math/cmplx"
 import sdl "vendor:sdl3"
 
 /* Globals */
@@ -84,13 +86,26 @@ app_init :: proc "c" (appstate: ^rawptr, argc: c.int, argv: [^]cstring) -> sdl.A
 }
 
 app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
+	context = runtime.default_context()
 	state := cast(^AppState)appstate
 
-	// TODO: Read audio from recording device
+	// bytes_read := sdl.GetAudioStreamData(
+	// 	state.audio_stream,
+	// 	&state.audio_buffer,
+	// 	len(state.audio_buffer),
+	// )
 
-	now := f64(sdl.GetTicks()) / 1000
+	// if bytes_read < 0 {
+	// 	sdl.Log("Failed to read bytes from capture device: %s", sdl.GetError())
+	// 	return .FAILURE
+	// }
+
+	// sdl.Log("%d", bytes_read)
+
 	{
 		using state
+
+		now := f64(sdl.GetTicks()) / 1000
 
 		background.r = f32(0.5 + 0.5 * sdl.sin(now))
 		background.g = f32(0.5 + 0.5 * sdl.sin(now + math.PI * 2 / 3))
@@ -124,7 +139,7 @@ app_event :: proc "c" (appstate: rawptr, event: ^sdl.Event) -> sdl.AppResult {
 app_quit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 	state := cast(^AppState)appstate
 
-	sdl.Log("Quitting %s after %s...\n", APP_NAME, result == .SUCCESS ? "success" : "failure")
+	sdl.Log("Quitting %s with result %d", APP_NAME, result)
 
 	sdl.DestroyAudioStream(state.audio_stream)
 	sdl.DestroyRenderer(renderer)
@@ -133,3 +148,66 @@ app_quit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 
 	sdl.free(appstate)
 }
+
+/* Fast Fourier Transform */
+
+bit_reverse :: proc(x: int, bits: int) -> int {
+	x := x
+	y := 0
+
+	for i in 0 ..< bits {
+		y = (y << 1) | (x & 1)
+		x >>= 1
+	}
+
+	return y
+}
+
+bit_reversal_permutation :: proc(data: []f32) {
+	n := len(data)
+
+	// Compute bit length of data length
+	bits := 0; for tmp := n; tmp > 1; tmp >>= 1 do bits += 1
+
+	for i in 0 ..< n {
+		j := bit_reverse(i, bits)
+		if j > i do data[i], data[j] = data[j], data[i]
+	}
+}
+
+/// In-place radix-2 Cooley-Tukey FFT (NOTE: Data length must be a power of 2)
+/// https://en.wikipedia.org/wiki/Cooley%E2%80%93Tukey_FFT_algorithm
+fft :: proc(data: []complex64) {
+}
+// 	n := len(data)
+
+// 	if n <= 1 do return
+
+// 	// Compute bit length of n
+// 	bits := 0; for tmp := n; tmp > 1; tmp >>= 1 do bits += 1
+
+// 	// Bit-reversal permutation
+// 	for i in 0 ..< n {
+// 		j := bit_reverse(i, bits)
+// 		if j > i do data[i], data[j] = data[j], data[i]
+// 	}
+
+// 	// Iterative FFT
+// 	for s in 1 ..< math.log2(f32(n)) {
+// 		m := math.pow(2, s)
+// 		omega_m := math.exp(f32(-2) * math.PI * i / m)
+// 		for k: f32 = 0; k < f32(n); k += m {
+// 			omega: f32 = 1
+// 			for j in 0 ..< (m / 2 - 1) {
+// 				index_t := int(k + j + m / 2)
+// 				index_u := int(k + j)
+
+// 				t := omega * data[index_t]
+// 				u := data[index_u]
+// 				data[index_u] = u + t
+// 				data[index_t] = u - t
+// 				omega *= omega_m
+// 			}
+// 		}
+// 	}
+// }
