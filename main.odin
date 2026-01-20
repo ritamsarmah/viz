@@ -13,12 +13,14 @@ APP_NAME :: "viz"
 WINDOW_WIDTH :: 800
 WINDOW_HEIGHT :: 800
 
+// Audio stream API returns bytes and must be converted to f32 (4 bytes)
 AUDIO_BUFFER_LEN :: 1024
+AUDIO_BUFFER_LEN_BYTES: i32 = AUDIO_BUFFER_LEN * size_of(f32)
 
 window: ^sdl.Window
 renderer: ^sdl.Renderer
 audio_spec := sdl.AudioSpec {
-	format   = .S16,
+	format   = .F32,
 	channels = 1,
 	freq     = 44100,
 }
@@ -27,7 +29,8 @@ audio_spec := sdl.AudioSpec {
 AppState :: struct {
 	background:   sdl.FColor,
 	audio_stream: ^sdl.AudioStream,
-	audio_buffer: [AUDIO_BUFFER_LEN]i16,
+	audio_buffer: [AUDIO_BUFFER_LEN]f32,
+	fft_buffer:   [AUDIO_BUFFER_LEN]complex64,
 }
 
 /* Functions */
@@ -89,36 +92,23 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	context = runtime.default_context()
 	state := cast(^AppState)appstate
 
-	// bytes_read := sdl.GetAudioStreamData(
-	// 	state.audio_stream,
-	// 	&state.audio_buffer,
-	// 	len(state.audio_buffer),
-	// )
-
-	// if bytes_read < 0 {
-	// 	sdl.Log("Failed to read bytes from capture device: %s", sdl.GetError())
-	// 	return .FAILURE
-	// }
-
-	// sdl.Log("%d", bytes_read)
-
-	{
-		using state
-
-		now := f64(sdl.GetTicks()) / 1000
-
-		background.r = f32(0.5 + 0.5 * sdl.sin(now))
-		background.g = f32(0.5 + 0.5 * sdl.sin(now + math.PI * 2 / 3))
-		background.b = f32(0.5 + 0.5 * sdl.sin(now + math.PI * 4 / 3))
-		background.a = sdl.ALPHA_OPAQUE_FLOAT
-
-		sdl.SetRenderDrawColorFloat(
-			renderer,
-			background.r,
-			background.b,
-			background.g,
-			background.a,
+	// Fill audio buffer when there is enough data
+	if sdl.GetAudioStreamAvailable(state.audio_stream) >= AUDIO_BUFFER_LEN_BYTES {
+		byte_count := sdl.GetAudioStreamData(
+			state.audio_stream,
+			&state.audio_buffer,
+			AUDIO_BUFFER_LEN_BYTES,
 		)
+
+		sample_count := byte_count / size_of(f32)
+
+		// Use implicit conversion of f32 audio data to complex64 for FFT
+		for i in 0 ..< sample_count {
+			w := 0.5 * (1 - math.cos(2 * math.PI * f32(i) / f32(sample_count - 1)))
+			state.fft_buffer[i] = state.audio_buffer[i] * w
+		}
+
+		fft(state.fft_buffer[:])
 	}
 
 	sdl.RenderClear(renderer)
@@ -163,7 +153,7 @@ bit_reverse :: proc(x: int, bits: int) -> int {
 	return y
 }
 
-bit_reversal_permutation :: proc(data: []f32) {
+bit_reversal_permutation :: proc(data: []$T) {
 	n := len(data)
 
 	// Compute bit length of data length
@@ -175,39 +165,35 @@ bit_reversal_permutation :: proc(data: []f32) {
 	}
 }
 
-/// In-place radix-2 Cooley-Tukey FFT (NOTE: Data length must be a power of 2)
+/// In-place radix-2 Cooley-Tukey FFT
 /// https://en.wikipedia.org/wiki/Cooley%E2%80%93Tukey_FFT_algorithm
 fft :: proc(data: []complex64) {
+	n := len(data)
+	if n <= 1 do return
+
+	assert(n & (n - 1) == 0, "Length must be a power of 2")
+
+	bit_reversal_permutation(data)
+
+	for s in 1 ..= math.log2(f32(n)) {
+		m := 1 << uint(s)
+		half := m >> 1
+
+		angle := -2 * math.PI / f32(m)
+		w_m := cmplx.exp(complex64(angle) * 1i) // mth root of unity
+
+		for k := 0; k < n; k += m {
+			w: complex64 = 1
+
+			for j in 0 ..< half {
+				t := w * data[k + j + half]
+				u := data[k + j]
+
+				data[k + j] = u + t
+				data[k + j + half] = u - t
+
+				w *= w_m
+			}
+		}
+	}
 }
-// 	n := len(data)
-
-// 	if n <= 1 do return
-
-// 	// Compute bit length of n
-// 	bits := 0; for tmp := n; tmp > 1; tmp >>= 1 do bits += 1
-
-// 	// Bit-reversal permutation
-// 	for i in 0 ..< n {
-// 		j := bit_reverse(i, bits)
-// 		if j > i do data[i], data[j] = data[j], data[i]
-// 	}
-
-// 	// Iterative FFT
-// 	for s in 1 ..< math.log2(f32(n)) {
-// 		m := math.pow(2, s)
-// 		omega_m := math.exp(f32(-2) * math.PI * i / m)
-// 		for k: f32 = 0; k < f32(n); k += m {
-// 			omega: f32 = 1
-// 			for j in 0 ..< (m / 2 - 1) {
-// 				index_t := int(k + j + m / 2)
-// 				index_u := int(k + j)
-
-// 				t := omega * data[index_t]
-// 				u := data[index_u]
-// 				data[index_u] = u + t
-// 				data[index_t] = u - t
-// 				omega *= omega_m
-// 			}
-// 		}
-// 	}
-// }
