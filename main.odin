@@ -25,12 +25,13 @@ audio_spec := sdl.AudioSpec {
 	freq     = 44100,
 }
 
-
 AppState :: struct {
-	background:   sdl.FColor,
-	audio_stream: ^sdl.AudioStream,
-	audio_buffer: [AUDIO_BUFFER_LEN]f32,
-	fft_buffer:   [AUDIO_BUFFER_LEN]complex64,
+	audio:      struct {
+		stream:     ^sdl.AudioStream,
+		raw_buffer: [AUDIO_BUFFER_LEN]f32,
+		fft_buffer: [AUDIO_BUFFER_LEN]complex64,
+	},
+	visualizer: struct{},
 }
 
 /* Functions */
@@ -40,6 +41,8 @@ main :: proc() {
 }
 
 app_init :: proc "c" (appstate: ^rawptr, argc: c.int, argv: [^]cstring) -> sdl.AppResult {
+	context = runtime.default_context()
+
 	sdl.Log("Initializing %s...\n", APP_NAME)
 	if ok := sdl.SetAppMetadata(APP_NAME, "1.0", "me.ritam.viz"); !ok {
 		sdl.Log("Failed to set app metadata: %s", sdl.GetError())
@@ -53,7 +56,6 @@ app_init :: proc "c" (appstate: ^rawptr, argc: c.int, argv: [^]cstring) -> sdl.A
 	}
 
 	state := cast(^AppState)appstate^
-	state.background = {0, 0, 0, sdl.ALPHA_OPAQUE_FLOAT}
 
 	if ok := sdl.Init({.VIDEO, .AUDIO}); !ok {
 		sdl.Log("Failed to initialize SDL: %s\n", sdl.GetError())
@@ -75,7 +77,7 @@ app_init :: proc "c" (appstate: ^rawptr, argc: c.int, argv: [^]cstring) -> sdl.A
 	sdl.SetRenderVSync(renderer, 1)
 	sdl.SetRenderLogicalPresentation(renderer, WINDOW_WIDTH, WINDOW_HEIGHT, .LETTERBOX)
 
-	state.audio_stream = sdl.OpenAudioDeviceStream(
+	state.audio.stream = sdl.OpenAudioDeviceStream(
 		sdl.AUDIO_DEVICE_DEFAULT_RECORDING,
 		&audio_spec,
 		nil,
@@ -83,7 +85,7 @@ app_init :: proc "c" (appstate: ^rawptr, argc: c.int, argv: [^]cstring) -> sdl.A
 	)
 
 	// Device starts paused, so must be manually started
-	sdl.ResumeAudioStreamDevice(state.audio_stream)
+	sdl.ResumeAudioStreamDevice(state.audio.stream)
 
 	return .CONTINUE
 }
@@ -92,30 +94,40 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	context = runtime.default_context()
 	state := cast(^AppState)appstate
 
-	// Fill audio buffer when there is enough data
-	if sdl.GetAudioStreamAvailable(state.audio_stream) >= AUDIO_BUFFER_LEN_BYTES {
-		byte_count := sdl.GetAudioStreamData(
-			state.audio_stream,
-			&state.audio_buffer,
-			AUDIO_BUFFER_LEN_BYTES,
-		)
+	/* Audio Processing */
+	{
+		using state.audio
 
-		sample_count := byte_count / size_of(f32)
+		if sdl.GetAudioStreamAvailable(stream) >= AUDIO_BUFFER_LEN * size_of(f32) {
+			byte_count := sdl.GetAudioStreamData(
+				stream,
+				&raw_buffer,
+				AUDIO_BUFFER_LEN * size_of(f32),
+			)
 
-		// Use implicit conversion of f32 audio data to complex64 for FFT
-		for i in 0 ..< sample_count {
-			w := 0.5 * (1 - math.cos(2 * math.PI * f32(i) / f32(sample_count - 1)))
-			state.fft_buffer[i] = state.audio_buffer[i] * w
+			sample_count := byte_count / size_of(f32)
+
+			// Apply Hann smoothing
+			for i in 0 ..< sample_count {
+				w := 0.5 * (1 - math.cos(2 * math.PI * f32(i) / f32(sample_count - 1)))
+				fft_buffer[i] = raw_buffer[i] * w
+			}
+
+			fft(fft_buffer[:])
 		}
-
-		fft(state.fft_buffer[:])
 	}
 
-	sdl.RenderClear(renderer)
-	sdl.RenderPresent(renderer)
+	/* Visualizer */
+	{
+		using state.visualizer
+
+		sdl.RenderClear(renderer)
+		sdl.RenderPresent(renderer)
+	}
 
 	return .CONTINUE
 }
+
 
 app_event :: proc "c" (appstate: rawptr, event: ^sdl.Event) -> sdl.AppResult {
 	#partial switch event.type {
@@ -131,7 +143,7 @@ app_quit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 
 	sdl.Log("Quitting %s with result %d", APP_NAME, result)
 
-	sdl.DestroyAudioStream(state.audio_stream)
+	sdl.DestroyAudioStream(state.audio.stream)
 	sdl.DestroyRenderer(renderer)
 	sdl.DestroyWindow(window)
 	sdl.Quit()
