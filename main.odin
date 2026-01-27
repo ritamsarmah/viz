@@ -1,6 +1,5 @@
 package main
 
-import "base:runtime"
 import "core:c"
 import "core:math"
 import "core:math/cmplx"
@@ -13,17 +12,30 @@ APP_NAME :: "viz"
 WINDOW_WIDTH :: 800
 WINDOW_HEIGHT :: 800
 
-// Audio stream API returns bytes and must be converted to f32 (4 bytes)
-AUDIO_BUFFER_LEN :: 1024
-AUDIO_BUFFER_LEN_BYTES: i32 = AUDIO_BUFFER_LEN * size_of(f32)
 SAMPLE_RATE :: 44100
-NOISE_FLOOR_DB :: -80
+NUM_SAMPLES :: 1024 // must be power of 2 for FFT
+NUM_SAMPLE_BYTES :: NUM_SAMPLES * size_of(f32)
+NUM_BINS :: (NUM_SAMPLES / 2) + 1 // Based on Nyquist frequency
 
-SMOOTHING_FACTOR :: 0.2 // between 0.1 and 0.3; lower value means higher smoothing
+LOG_MIN :: -80.0
+LOG_MAX :: 0.0
+INVERSE_RANGE :: 1.0 / (LOG_MAX - LOG_MIN)
 
-low_bin := max(frequency_bin(20), 1) // Exclude DC (bin 0)
-mid_bin := frequency_bin(250)
-high_bin := frequency_bin(4000)
+BAR_WIDTH :: 1.0
+SMOOTHING_FACTOR :: 0.85
+
+// band_indices := [NUM_BANDS + 1]int {
+// 	frequency_bin(20), // sub-bass (omitting DC bin)
+// 	frequency_bin(50), // mid-bass
+// 	frequency_bin(100), // upper bass
+// 	frequency_bin(250), // lower mids
+// 	frequency_bin(500), // mids
+// 	frequency_bin(2000), // upper mids
+// 	frequency_bin(4000), // lower treble
+// 	frequency_bin(6000), // mid treble
+// 	frequency_bin(10000), // upper treble
+// 	frequency_bin(20000), // treble cutoff
+// }
 
 window: ^sdl.Window
 renderer: ^sdl.Renderer
@@ -35,12 +47,13 @@ audio_spec := sdl.AudioSpec {
 
 AppState :: struct {
 	audio:      struct {
-		stream:      ^sdl.AudioStream,
-		real_buffer: [AUDIO_BUFFER_LEN]f32,
-		fft_buffer:  [AUDIO_BUFFER_LEN]complex64,
-		bands:       [3]f32,
+		stream:     ^sdl.AudioStream,
+		buffer:     [NUM_SAMPLES]f32,
+		fft_buffer: [NUM_SAMPLES]complex64,
 	},
-	visualizer: struct{},
+	visualizer: struct {
+		rects: [NUM_BINS]sdl.FRect,
+	},
 }
 
 /* Functions */
@@ -50,8 +63,6 @@ main :: proc() {
 }
 
 app_init :: proc "c" (appstate: ^rawptr, argc: c.int, argv: [^]cstring) -> sdl.AppResult {
-	context = runtime.default_context()
-
 	sdl.Log("Initializing %s...\n", APP_NAME)
 	if ok := sdl.SetAppMetadata(APP_NAME, "1.0", "me.ritam.viz"); !ok {
 		sdl.Log("Failed to set app metadata: %s", sdl.GetError())
@@ -65,6 +76,13 @@ app_init :: proc "c" (appstate: ^rawptr, argc: c.int, argv: [^]cstring) -> sdl.A
 	}
 
 	state := cast(^AppState)appstate^
+
+	// Initialize visualizer rects
+	for &rect, i in state.visualizer.rects {
+		rect.x = BAR_WIDTH * f32(i)
+		rect.y = WINDOW_HEIGHT
+		rect.w = BAR_WIDTH
+	}
 
 	if ok := sdl.Init({.VIDEO, .AUDIO}); !ok {
 		sdl.Log("Failed to initialize SDL: %s\n", sdl.GetError())
@@ -100,66 +118,55 @@ app_init :: proc "c" (appstate: ^rawptr, argc: c.int, argv: [^]cstring) -> sdl.A
 }
 
 app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
-	context = runtime.default_context()
 	state := cast(^AppState)appstate
 
 	/* Audio Processing */
 	{
 		using state.audio
 
-		if sdl.GetAudioStreamAvailable(stream) >= AUDIO_BUFFER_LEN * size_of(f32) {
-			byte_count := sdl.GetAudioStreamData(
-				stream,
-				&real_buffer,
-				AUDIO_BUFFER_LEN * size_of(f32),
-			)
+		if sdl.GetAudioStreamAvailable(stream) >= NUM_SAMPLE_BYTES {
+			byte_count := sdl.GetAudioStreamData(stream, &buffer, NUM_SAMPLE_BYTES)
+			mean := math.sum(buffer[:]) / NUM_SAMPLES
 
-			N := byte_count / size_of(f32) // sample count
-			mean := math.sum(real_buffer[:N]) / f32(N)
-
-			for i in 0 ..< N {
+			// Preprocess samples
+			for i in 0 ..< NUM_SAMPLES {
 				// Subtract mean to remove DC bias
-				real_buffer[i] -= mean
+				buffer[i] -= mean
 
 				// Apply Hann window to reduce spectral leakage
-				real_buffer[i] *= 0.5 * (1 - math.cos(2 * math.PI * f32(i) / f32(N - 1)))
+				buffer[i] *= 0.5 * (1 - math.cos(2 * math.PI * f32(i) / f32(NUM_SAMPLES - 1)))
 
-				// Implicit conversion from f32 to complex64
-				fft_buffer[i] = real_buffer[i]
+				// Convert to complex number
+				fft_buffer[i] = complex(buffer[i], 0)
 			}
 
-			fft(fft_buffer[:N])
+			fft(fft_buffer[:])
 
-			// Nyquist frequency means valid bins are only 0 to n/2
-			bins := fft_buffer[:(N / 2) + 1]
-
-			// Calculate magnitudes, reusing real data buffer
-			magnitudes := real_buffer[:]
-			for bin, i in bins {
-				real := cmplx.real(bin)
-				imag := cmplx.imag(bin)
+			// Calculate magnitudes (reusing buffer used for original samples)
+			magnitudes := buffer[:NUM_BINS]
+			for value, i in fft_buffer[:NUM_BINS] {
+				real := cmplx.real(value)
+				imag := cmplx.imag(value)
 				magnitudes[i] = math.sqrt(real * real + imag * imag)
 			}
 
-			// Aggregate energy per band
-			low := rms(magnitudes[low_bin:mid_bin])
-			mid := rms(magnitudes[mid_bin:high_bin])
-			high := rms(magnitudes[high_bin:])
+			// for i in 0 ..< len(band_indices) - 1 {
+			// 	// Band RMS
+			// 	start := band_indices[i]
+			// 	end := band_indices[i + 1]
+			// 	raw := rms(magnitudes[start:end])
 
-			// Log scaling with small epsilon to avoid log(0)
-			low = 20 * math.log10(low + 1e-12)
-			mid = 20 * math.log10(mid + 1e-12)
-			high = 20 * math.log10(high + 1e-12)
+			// 	// Temporal smoothing
+			// }
 
-			// Noise floor suppression
-			if low < NOISE_FLOOR_DB do low = NOISE_FLOOR_DB
-			if mid < NOISE_FLOOR_DB do mid = NOISE_FLOOR_DB
-			if high < NOISE_FLOOR_DB do high = NOISE_FLOOR_DB
 
-			// Temporal smoothing
-			bands[0] = bands[0] * (1 - SMOOTHING_FACTOR) + low * SMOOTHING_FACTOR
-			bands[1] = bands[1] * (1 - SMOOTHING_FACTOR) + mid * SMOOTHING_FACTOR
-			bands[2] = bands[2] * (1 - SMOOTHING_FACTOR) + high * SMOOTHING_FACTOR
+			// Log compression and normalization
+			for &magnitude in magnitudes {
+				scaled := math.log10(magnitude + 1e-12)
+				clamped := math.max(math.min(scaled, LOG_MAX), LOG_MIN)
+				raw := (clamped - LOG_MIN) / (LOG_MAX - LOG_MIN)
+				magnitude = SMOOTHING_FACTOR * magnitude + (1 - SMOOTHING_FACTOR) * raw
+			}
 		}
 	}
 
@@ -167,7 +174,16 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	{
 		using state.visualizer
 
+		sdl.SetRenderDrawColor(renderer, 0, 0, 0, sdl.ALPHA_OPAQUE)
 		sdl.RenderClear(renderer)
+
+		sdl.SetRenderDrawColor(renderer, 0, 255, 0, sdl.ALPHA_OPAQUE)
+
+		for &rect, i in rects {
+			rect.h = -state.audio.buffer[i] * f32(WINDOW_HEIGHT)
+			sdl.RenderFillRect(renderer, &rect)
+		}
+
 		sdl.RenderPresent(renderer)
 	}
 
@@ -199,7 +215,7 @@ app_quit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 
 /* Fast Fourier Transform */
 
-bit_reverse :: proc(x: int, bits: int) -> int {
+bit_reverse :: proc "contextless" (x: int, bits: int) -> int {
 	x := x
 	y := 0
 
@@ -211,7 +227,7 @@ bit_reverse :: proc(x: int, bits: int) -> int {
 	return y
 }
 
-bit_reversal_permutation :: proc(data: []$T) {
+bit_reversal_permutation :: proc "contextless" (data: []$T) {
 	n := len(data)
 
 	// Compute bit length of data length
@@ -225,11 +241,9 @@ bit_reversal_permutation :: proc(data: []$T) {
 
 /// In-place radix-2 Cooley-Tukey FFT
 /// https://en.wikipedia.org/wiki/Cooley%E2%80%93Tukey_FFT_algorithm
-fft :: proc(data: []complex64) {
+fft :: proc "contextless" (data: []complex64) {
 	n := len(data)
 	if n <= 1 do return
-
-	assert(n & (n - 1) == 0, "Length must be a power of 2")
 
 	bit_reversal_permutation(data)
 
@@ -258,8 +272,9 @@ fft :: proc(data: []complex64) {
 
 /* Utilities */
 
-frequency_bin :: proc "contextless" (hz: int) -> int {
-	return int(math.floor(f32(hz * AUDIO_BUFFER_LEN) / f32(SAMPLE_RATE)))
+frequency_bin :: proc "contextless" (hz: f32) -> int {
+	// Clamped between 1 (omitting DC bin) and max bin
+	return clamp(int(math.floor(hz * NUM_SAMPLES / SAMPLE_RATE)), 1, NUM_BINS - 1)
 }
 
 rms :: proc "contextless" (values: []f32) -> f32 {
