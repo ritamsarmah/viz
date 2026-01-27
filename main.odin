@@ -16,20 +16,29 @@ WINDOW_HEIGHT :: 800
 // Audio stream API returns bytes and must be converted to f32 (4 bytes)
 AUDIO_BUFFER_LEN :: 1024
 AUDIO_BUFFER_LEN_BYTES: i32 = AUDIO_BUFFER_LEN * size_of(f32)
+SAMPLE_RATE :: 44100
+NOISE_FLOOR_DB :: -80
+
+SMOOTHING_FACTOR :: 0.2 // between 0.1 and 0.3; lower value means higher smoothing
+
+low_bin := max(frequency_bin(20), 1) // Exclude DC (bin 0)
+mid_bin := frequency_bin(250)
+high_bin := frequency_bin(4000)
 
 window: ^sdl.Window
 renderer: ^sdl.Renderer
 audio_spec := sdl.AudioSpec {
 	format   = .F32,
 	channels = 1,
-	freq     = 44100,
+	freq     = SAMPLE_RATE,
 }
 
 AppState :: struct {
 	audio:      struct {
-		stream:     ^sdl.AudioStream,
-		raw_buffer: [AUDIO_BUFFER_LEN]f32,
-		fft_buffer: [AUDIO_BUFFER_LEN]complex64,
+		stream:      ^sdl.AudioStream,
+		real_buffer: [AUDIO_BUFFER_LEN]f32,
+		fft_buffer:  [AUDIO_BUFFER_LEN]complex64,
+		bands:       [3]f32,
 	},
 	visualizer: struct{},
 }
@@ -101,19 +110,56 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 		if sdl.GetAudioStreamAvailable(stream) >= AUDIO_BUFFER_LEN * size_of(f32) {
 			byte_count := sdl.GetAudioStreamData(
 				stream,
-				&raw_buffer,
+				&real_buffer,
 				AUDIO_BUFFER_LEN * size_of(f32),
 			)
 
-			sample_count := byte_count / size_of(f32)
+			N := byte_count / size_of(f32) // sample count
+			mean := math.sum(real_buffer[:N]) / f32(N)
 
-			// Apply Hann smoothing
-			for i in 0 ..< sample_count {
-				w := 0.5 * (1 - math.cos(2 * math.PI * f32(i) / f32(sample_count - 1)))
-				fft_buffer[i] = raw_buffer[i] * w
+			for i in 0 ..< N {
+				// Subtract mean to remove DC bias
+				real_buffer[i] -= mean
+
+				// Apply Hann window to reduce spectral leakage
+				real_buffer[i] *= 0.5 * (1 - math.cos(2 * math.PI * f32(i) / f32(N - 1)))
+
+				// Implicit conversion from f32 to complex64
+				fft_buffer[i] = real_buffer[i]
 			}
 
-			fft(fft_buffer[:])
+			fft(fft_buffer[:N])
+
+			// Nyquist frequency means valid bins are only 0 to n/2
+			bins := fft_buffer[:(N / 2) + 1]
+
+			// Calculate magnitudes, reusing real data buffer
+			magnitudes := real_buffer[:]
+			for bin, i in bins {
+				real := cmplx.real(bin)
+				imag := cmplx.imag(bin)
+				magnitudes[i] = math.sqrt(real * real + imag * imag)
+			}
+
+			// Aggregate energy per band
+			low := rms(magnitudes[low_bin:mid_bin])
+			mid := rms(magnitudes[mid_bin:high_bin])
+			high := rms(magnitudes[high_bin:])
+
+			// Log scaling with small epsilon to avoid log(0)
+			low = 20 * math.log10(low + 1e-12)
+			mid = 20 * math.log10(mid + 1e-12)
+			high = 20 * math.log10(high + 1e-12)
+
+			// Noise floor suppression
+			if low < NOISE_FLOOR_DB do low = NOISE_FLOOR_DB
+			if mid < NOISE_FLOOR_DB do mid = NOISE_FLOOR_DB
+			if high < NOISE_FLOOR_DB do high = NOISE_FLOOR_DB
+
+			// Temporal smoothing
+			bands[0] = bands[0] * (1 - SMOOTHING_FACTOR) + low * SMOOTHING_FACTOR
+			bands[1] = bands[1] * (1 - SMOOTHING_FACTOR) + mid * SMOOTHING_FACTOR
+			bands[2] = bands[2] * (1 - SMOOTHING_FACTOR) + high * SMOOTHING_FACTOR
 		}
 	}
 
@@ -208,4 +254,19 @@ fft :: proc(data: []complex64) {
 			}
 		}
 	}
+}
+
+/* Utilities */
+
+frequency_bin :: proc "contextless" (hz: int) -> int {
+	return int(math.floor(f32(hz * AUDIO_BUFFER_LEN) / f32(SAMPLE_RATE)))
+}
+
+rms :: proc "contextless" (values: []f32) -> f32 {
+	sum: f32 = 0
+	for value in values {
+		sum += value * value
+	}
+
+	return math.sqrt(sum / f32(len(values)))
 }

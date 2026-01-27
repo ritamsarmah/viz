@@ -1,13 +1,14 @@
-all: build
+.PHONY: all debug release clean
 
-build:
-	odin build . -o:speed
+OUT := viz
+
+all: debug
 
 debug:
-	odin build . -o:minimal
+	odin build . -debug -o:none -out:$(OUT)
 
-deploy:
-	odin build . -o:speed -target=linux_arm64
+release:
+	odin build . -o:speed -out:$(OUT)
 
 clean:
-	rm -f viz
+	rm -f $(OUT)
