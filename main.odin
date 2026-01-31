@@ -20,19 +20,17 @@ NUM_SAMPLE_BYTES :: NUM_SAMPLES * size_of(f32)
 NUM_BINS :: (NUM_SAMPLES / 2) + 1 // Based on Nyquist frequency
 
 LOW_CUTOFF :: 16
-HIGH_CUTOFF :: NUM_BINS - 32
+HIGH_CUTOFF :: NUM_BINS - 256
 NUM_BANDS :: HIGH_CUTOFF - LOW_CUTOFF
 
-AUDIO_SMOOTHING :: 0.85
+AUDIO_SMOOTHING :: 0.8
 SILENCE_THRESHOLD: f32 = 1e-4
 MIN_DB :: -80.0
 MAX_DB :: 0.0
 INVERSE_RANGE :: 1.0 / (MAX_DB - MIN_DB)
 
-VISUALIZER_RADIUS: f32 : 20.0
-VISUALIZER_ANGLE_STEP :: 2.0 * math.PI / f32(NUM_BANDS)
-BAR_WIDTH: f32 : 2
-MAX_BAR_HEIGHT: f32 : 256
+MIN_RADIUS :: 16.0
+MAX_RADIUS :: 256.0
 VISUAL_SMOOTHING :: 0.7
 COLOR_CHANGE_RATE :: 0.2
 
@@ -52,7 +50,8 @@ AppState :: struct {
 		bands:      [NUM_BANDS]f32,
 	},
 	visualizer: struct {
-		heights: [NUM_BANDS]f32,
+		magnitudes: [NUM_BANDS]f32,
+		points:     [NUM_BANDS * 2]sdl.FPoint,
 	},
 }
 
@@ -135,14 +134,11 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 
 			fft(fft_buffer[:])
 
-			// Compute power spectrum
 			for value, i in fft_buffer[LOW_CUTOFF:HIGH_CUTOFF] {
 				real := cmplx.real(value)
 				imag := cmplx.imag(value)
-				power := real * real + imag * imag
-
-				// Convert power spectrum to decibels for perceptual scaling
-				power = 10.0 * math.log10(power + 1e-6)
+				magnitude := math.sqrt(real * real + imag * imag)
+				power := 20 * math.log10(magnitude + 1e-6)
 
 				// Normalize to 0–1 range based on expected dB limits
 				power = (power - MIN_DB) * INVERSE_RANGE
@@ -157,34 +153,32 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	/* Visualizer */
 	{
 		using state.visualizer
-		bands := state.audio.bands[:]
 
 		sdl.SetRenderDrawColor(renderer, 0, 0, 0, sdl.ALPHA_OPAQUE)
 		sdl.RenderClear(renderer)
 
-		for &height, i in heights {
-			height = VISUAL_SMOOTHING * height + (1 - VISUAL_SMOOTHING) * bands[i] * MAX_BAR_HEIGHT
-			angle := f32(i) * VISUALIZER_ANGLE_STEP
+		for band, i in state.audio.bands {
+			point := &points[i]
+			mirror := &points[len(points) - i - 1]
 
-			// Compute end point for top half
-			end_x := WINDOW_CENTER_X + math.sin(angle) * (VISUALIZER_RADIUS + height)
-			end_y := WINDOW_CENTER_Y + math.cos(angle) * (VISUALIZER_RADIUS + height)
+			magnitudes[i] =
+				VISUAL_SMOOTHING * magnitudes[i] + (1 - VISUAL_SMOOTHING) * band * MAX_RADIUS
+			angle := f32(i) * math.PI / len(state.audio.bands)
 
-			// Compute mirrored end point for bottom half
-			mirror_x := WINDOW_CENTER_X - math.sin(angle) * (VISUALIZER_RADIUS + height)
-			mirror_y := WINDOW_CENTER_Y + math.cos(angle) * (VISUALIZER_RADIUS + height)
+			point.x = WINDOW_CENTER_X + math.sin(angle) * (MIN_RADIUS + magnitudes[i])
+			point.y = WINDOW_CENTER_Y + math.cos(angle) * (MIN_RADIUS + magnitudes[i])
 
-			now := f64(sdl.GetTicks()) / 1000 * COLOR_CHANGE_RATE
-			r := f32(0.5 + 0.5 * sdl.sin(now))
-			g := f32(0.5 + 0.5 * sdl.sin(now + math.PI * 2 / 3))
-			b := f32(0.5 + 0.5 * sdl.sin(now + math.PI * 4 / 3))
-
-			sdl.SetRenderDrawColorFloat(renderer, r, g, b, sdl.ALPHA_OPAQUE)
-
-			sdl.RenderLine(renderer, WINDOW_CENTER_X, WINDOW_CENTER_Y, end_x, end_y)
-			sdl.RenderLine(renderer, WINDOW_CENTER_X, WINDOW_CENTER_Y, mirror_x, mirror_y)
+			mirror.x = 2 * WINDOW_CENTER_X - point.x
+			mirror.y = point.y
 		}
 
+		now := f64(sdl.GetTicks()) / 1000 * COLOR_CHANGE_RATE
+		r := f32(0.5 + 0.5 * math.sin(now))
+		g := f32(0.5 + 0.5 * math.sin(now + math.PI * 2 / 3))
+		b := f32(0.5 + 0.5 * math.sin(now + math.PI * 4 / 3))
+		sdl.SetRenderDrawColorFloat(renderer, r, g, b, sdl.ALPHA_OPAQUE_FLOAT)
+
+		sdl.RenderLines(renderer, raw_data(points[:]), len(points))
 		sdl.RenderPresent(renderer)
 	}
 
