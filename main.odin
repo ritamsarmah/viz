@@ -33,7 +33,8 @@ VISUALIZER_RADIUS: f32 : 20.0
 VISUALIZER_ANGLE_STEP :: 2.0 * math.PI / f32(NUM_BANDS)
 BAR_WIDTH: f32 : 2
 MAX_BAR_HEIGHT: f32 : 256
-VIDEO_SMOOTHING :: 0.7
+VISUAL_SMOOTHING :: 0.7
+COLOR_CHANGE_RATE :: 0.2
 
 window: ^sdl.Window
 renderer: ^sdl.Renderer
@@ -162,7 +163,7 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 		sdl.RenderClear(renderer)
 
 		for &height, i in heights {
-			height = VIDEO_SMOOTHING * height + (1 - VIDEO_SMOOTHING) * bands[i] * MAX_BAR_HEIGHT
+			height = VISUAL_SMOOTHING * height + (1 - VISUAL_SMOOTHING) * bands[i] * MAX_BAR_HEIGHT
 			angle := f32(i) * VISUALIZER_ANGLE_STEP
 
 			// Compute end point for top half
@@ -173,7 +174,12 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 			mirror_x := WINDOW_CENTER_X - math.sin(angle) * (VISUALIZER_RADIUS + height)
 			mirror_y := WINDOW_CENTER_Y + math.cos(angle) * (VISUALIZER_RADIUS + height)
 
-			sdl.SetRenderDrawColor(renderer, 255, 0, 0, sdl.ALPHA_OPAQUE)
+			now := f64(sdl.GetTicks()) / 1000 * COLOR_CHANGE_RATE
+			r := f32(0.5 + 0.5 * sdl.sin(now))
+			g := f32(0.5 + 0.5 * sdl.sin(now + math.PI * 2 / 3))
+			b := f32(0.5 + 0.5 * sdl.sin(now + math.PI * 4 / 3))
+
+			sdl.SetRenderDrawColorFloat(renderer, r, g, b, sdl.ALPHA_OPAQUE)
 
 			sdl.RenderLine(renderer, WINDOW_CENTER_X, WINDOW_CENTER_Y, end_x, end_y)
 			sdl.RenderLine(renderer, WINDOW_CENTER_X, WINDOW_CENTER_Y, mirror_x, mirror_y)
