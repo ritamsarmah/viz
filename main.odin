@@ -11,31 +11,29 @@ APP_NAME :: "viz"
 
 WINDOW_WIDTH :: 800
 WINDOW_HEIGHT :: 800
+WINDOW_CENTER_X :: f32(WINDOW_WIDTH) / 2
+WINDOW_CENTER_Y :: f32(WINDOW_HEIGHT) / 2
 
 SAMPLE_RATE :: 44100
 NUM_SAMPLES :: 1024 // must be power of 2 for FFT
 NUM_SAMPLE_BYTES :: NUM_SAMPLES * size_of(f32)
 NUM_BINS :: (NUM_SAMPLES / 2) + 1 // Based on Nyquist frequency
 
-LOG_MIN :: -80.0
-LOG_MAX :: 0.0
-INVERSE_RANGE :: 1.0 / (LOG_MAX - LOG_MIN)
+LOW_CUTOFF :: 16
+HIGH_CUTOFF :: NUM_BINS - 32
+NUM_BANDS :: HIGH_CUTOFF - LOW_CUTOFF
 
-BAR_WIDTH :: 1.0
-SMOOTHING_FACTOR :: 0.85
+AUDIO_SMOOTHING :: 0.85
+SILENCE_THRESHOLD: f32 = 1e-4
+MIN_DB :: -80.0
+MAX_DB :: 0.0
+INVERSE_RANGE :: 1.0 / (MAX_DB - MIN_DB)
 
-// band_indices := [NUM_BANDS + 1]int {
-// 	frequency_bin(20), // sub-bass (omitting DC bin)
-// 	frequency_bin(50), // mid-bass
-// 	frequency_bin(100), // upper bass
-// 	frequency_bin(250), // lower mids
-// 	frequency_bin(500), // mids
-// 	frequency_bin(2000), // upper mids
-// 	frequency_bin(4000), // lower treble
-// 	frequency_bin(6000), // mid treble
-// 	frequency_bin(10000), // upper treble
-// 	frequency_bin(20000), // treble cutoff
-// }
+VISUALIZER_RADIUS: f32 : 20.0
+VISUALIZER_ANGLE_STEP :: 2.0 * math.PI / f32(NUM_BANDS)
+BAR_WIDTH: f32 : 2
+MAX_BAR_HEIGHT: f32 : 256
+VIDEO_SMOOTHING :: 0.7
 
 window: ^sdl.Window
 renderer: ^sdl.Renderer
@@ -50,9 +48,10 @@ AppState :: struct {
 		stream:     ^sdl.AudioStream,
 		buffer:     [NUM_SAMPLES]f32,
 		fft_buffer: [NUM_SAMPLES]complex64,
+		bands:      [NUM_BANDS]f32,
 	},
 	visualizer: struct {
-		rects: [NUM_BINS]sdl.FRect,
+		heights: [NUM_BANDS]f32,
 	},
 }
 
@@ -76,13 +75,6 @@ app_init :: proc "c" (appstate: ^rawptr, argc: c.int, argv: [^]cstring) -> sdl.A
 	}
 
 	state := cast(^AppState)appstate^
-
-	// Initialize visualizer rects
-	for &rect, i in state.visualizer.rects {
-		rect.x = BAR_WIDTH * f32(i)
-		rect.y = WINDOW_HEIGHT
-		rect.w = BAR_WIDTH
-	}
 
 	if ok := sdl.Init({.VIDEO, .AUDIO}); !ok {
 		sdl.Log("Failed to initialize SDL: %s\n", sdl.GetError())
@@ -142,30 +134,21 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 
 			fft(fft_buffer[:])
 
-			// Calculate magnitudes (reusing buffer used for original samples)
-			magnitudes := buffer[:NUM_BINS]
-			for value, i in fft_buffer[:NUM_BINS] {
+			// Compute power spectrum
+			for value, i in fft_buffer[LOW_CUTOFF:HIGH_CUTOFF] {
 				real := cmplx.real(value)
 				imag := cmplx.imag(value)
-				magnitudes[i] = math.sqrt(real * real + imag * imag)
-			}
+				power := real * real + imag * imag
 
-			// for i in 0 ..< len(band_indices) - 1 {
-			// 	// Band RMS
-			// 	start := band_indices[i]
-			// 	end := band_indices[i + 1]
-			// 	raw := rms(magnitudes[start:end])
+				// Convert power spectrum to decibels for perceptual scaling
+				power = 10.0 * math.log10(power + 1e-6)
 
-			// 	// Temporal smoothing
-			// }
+				// Normalize to 0–1 range based on expected dB limits
+				power = (power - MIN_DB) * INVERSE_RANGE
+				power = math.clamp(power, 0, 1)
 
-
-			// Log compression and normalization
-			for &magnitude in magnitudes {
-				scaled := math.log10(magnitude + 1e-12)
-				clamped := math.max(math.min(scaled, LOG_MAX), LOG_MIN)
-				raw := (clamped - LOG_MIN) / (LOG_MAX - LOG_MIN)
-				magnitude = SMOOTHING_FACTOR * magnitude + (1 - SMOOTHING_FACTOR) * raw
+				// Map spectrum bins to visual bands with smoothing
+				bands[i] = AUDIO_SMOOTHING * bands[i] + (1 - AUDIO_SMOOTHING) * power
 			}
 		}
 	}
@@ -173,15 +156,27 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	/* Visualizer */
 	{
 		using state.visualizer
+		bands := state.audio.bands[:]
 
 		sdl.SetRenderDrawColor(renderer, 0, 0, 0, sdl.ALPHA_OPAQUE)
 		sdl.RenderClear(renderer)
 
-		sdl.SetRenderDrawColor(renderer, 0, 255, 0, sdl.ALPHA_OPAQUE)
+		for &height, i in heights {
+			height = VIDEO_SMOOTHING * height + (1 - VIDEO_SMOOTHING) * bands[i] * MAX_BAR_HEIGHT
+			angle := f32(i) * VISUALIZER_ANGLE_STEP
 
-		for &rect, i in rects {
-			rect.h = -state.audio.buffer[i] * f32(WINDOW_HEIGHT)
-			sdl.RenderFillRect(renderer, &rect)
+			// Compute end point for top half
+			end_x := WINDOW_CENTER_X + math.sin(angle) * (VISUALIZER_RADIUS + height)
+			end_y := WINDOW_CENTER_Y + math.cos(angle) * (VISUALIZER_RADIUS + height)
+
+			// Compute mirrored end point for bottom half
+			mirror_x := WINDOW_CENTER_X - math.sin(angle) * (VISUALIZER_RADIUS + height)
+			mirror_y := WINDOW_CENTER_Y + math.cos(angle) * (VISUALIZER_RADIUS + height)
+
+			sdl.SetRenderDrawColor(renderer, 255, 0, 0, sdl.ALPHA_OPAQUE)
+
+			sdl.RenderLine(renderer, WINDOW_CENTER_X, WINDOW_CENTER_Y, end_x, end_y)
+			sdl.RenderLine(renderer, WINDOW_CENTER_X, WINDOW_CENTER_Y, mirror_x, mirror_y)
 		}
 
 		sdl.RenderPresent(renderer)
@@ -189,7 +184,6 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 
 	return .CONTINUE
 }
-
 
 app_event :: proc "c" (appstate: rawptr, event: ^sdl.Event) -> sdl.AppResult {
 	#partial switch event.type {
@@ -271,11 +265,6 @@ fft :: proc "contextless" (data: []complex64) {
 }
 
 /* Utilities */
-
-frequency_bin :: proc "contextless" (hz: f32) -> int {
-	// Clamped between 1 (omitting DC bin) and max bin
-	return clamp(int(math.floor(hz * NUM_SAMPLES / SAMPLE_RATE)), 1, NUM_BINS - 1)
-}
 
 rms :: proc "contextless" (values: []f32) -> f32 {
 	sum: f32 = 0
