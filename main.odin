@@ -20,10 +20,10 @@ NUM_SAMPLE_BYTES :: NUM_SAMPLES * size_of(f32)
 NUM_BINS :: (NUM_SAMPLES / 2) + 1 // Based on Nyquist frequency
 
 LOW_CUTOFF :: 16
-HIGH_CUTOFF :: NUM_BINS - 256
+HIGH_CUTOFF :: NUM_BINS - 257
 NUM_BANDS :: HIGH_CUTOFF - LOW_CUTOFF
 
-AUDIO_SMOOTHING :: 0.8
+AUDIO_SMOOTHING :: 0.6
 SILENCE_THRESHOLD: f32 = 1e-4
 MIN_DB :: -80.0
 MAX_DB :: 0.0
@@ -31,7 +31,9 @@ INVERSE_RANGE :: 1.0 / (MAX_DB - MIN_DB)
 
 MIN_RADIUS :: 16.0
 MAX_RADIUS :: 256.0
-VISUAL_SMOOTHING :: 0.7
+BAND_WINDOW :: 4 // Must evenly divide NUM_BANDS
+NUM_MAGNITUDES :: NUM_BANDS / BAND_WINDOW
+VISUAL_SMOOTHING :: 0.8
 COLOR_CHANGE_RATE :: 0.2
 
 window: ^sdl.Window
@@ -50,14 +52,16 @@ AppState :: struct {
 		bands:      [NUM_BANDS]f32,
 	},
 	visualizer: struct {
-		magnitudes: [NUM_BANDS]f32,
-		points:     [NUM_BANDS * 2]sdl.FPoint,
+		magnitudes: [NUM_MAGNITUDES]f32,
+		points:     [NUM_MAGNITUDES * 2]sdl.FPoint, // normal + mirrored points
 	},
 }
 
 /* Functions */
 
 main :: proc() {
+	assert(NUM_BANDS % BAND_WINDOW == 0)
+
 	sdl.EnterAppMainCallbacks(0, nil, app_init, app_iterate, app_event, app_quit)
 }
 
@@ -117,7 +121,7 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 		using state.audio
 
 		if sdl.GetAudioStreamAvailable(stream) >= NUM_SAMPLE_BYTES {
-			byte_count := sdl.GetAudioStreamData(stream, &buffer, NUM_SAMPLE_BYTES)
+			sdl.GetAudioStreamData(stream, &buffer, NUM_SAMPLE_BYTES)
 			mean := math.sum(buffer[:]) / NUM_SAMPLES
 
 			// Preprocess samples
@@ -154,19 +158,25 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	{
 		using state.visualizer
 
+		bands := state.audio.bands
+		total_angle: f32 = math.PI / NUM_MAGNITUDES
+
 		sdl.SetRenderDrawColor(renderer, 0, 0, 0, sdl.ALPHA_OPAQUE)
 		sdl.RenderClear(renderer)
 
-		for band, i in state.audio.bands {
+		for &magnitude, i in magnitudes {
+			start := i * BAND_WINDOW
+			end := start + BAND_WINDOW
+			value := math.sum(bands[start:end]) / BAND_WINDOW
+
 			point := &points[i]
 			mirror := &points[len(points) - i - 1]
 
-			magnitudes[i] =
-				VISUAL_SMOOTHING * magnitudes[i] + (1 - VISUAL_SMOOTHING) * band * MAX_RADIUS
-			angle := f32(i) * math.PI / len(state.audio.bands)
+			magnitude = VISUAL_SMOOTHING * magnitude + (1 - VISUAL_SMOOTHING) * value * MAX_RADIUS
+			angle := f32(i) * total_angle
 
-			point.x = WINDOW_CENTER_X + math.sin(angle) * (MIN_RADIUS + magnitudes[i])
-			point.y = WINDOW_CENTER_Y + math.cos(angle) * (MIN_RADIUS + magnitudes[i])
+			point.x = WINDOW_CENTER_X + math.sin(angle) * (MIN_RADIUS + magnitude)
+			point.y = WINDOW_CENTER_Y + math.cos(angle) * (MIN_RADIUS + magnitude)
 
 			mirror.x = 2 * WINDOW_CENTER_X - point.x
 			mirror.y = point.y
