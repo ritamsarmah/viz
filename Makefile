@@ -13,6 +13,7 @@ run: debug
 
 # Compile only producing object files to link on Raspberry Pi
 compile:
+	mkdir -p $(OUT)
 	odin build .  -target=linux_arm64 -build-mode=object -out:$(OUT)
 
 clean:
